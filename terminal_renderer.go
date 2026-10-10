@@ -10,6 +10,7 @@ import (
 
 	"github.com/charmbracelet/colorprofile"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/charmbracelet/x/ansi/kitty"
 )
 
 // ErrInvalidDimensions is returned when the dimensions of a window are invalid
@@ -593,6 +594,24 @@ func (s *TerminalRenderer) putCellLR(newbuf *RenderBuffer, cell *Cell) {
 	}
 }
 
+// cellStyle converts styling colors while preserving Kitty placeholder IDs.
+func (s *TerminalRenderer) cellStyle(cell *Cell) Style {
+	style := ConvertStyle(cell.Style, s.profile)
+	if s.profile == colorprofile.TrueColor || s.profile == colorprofile.NoTTY {
+		return style
+	}
+	// A cell may carry a pass-through sequence before its printable glyph.
+	// Only strip escapes on the uncommon path containing a placeholder.
+	if strings.ContainsRune(cell.Content, kitty.Placeholder) &&
+		strings.HasPrefix(ansi.Strip(cell.Content), string(kitty.Placeholder)) {
+		// These colors encode the image and placement IDs, not presentation.
+		// Background and text attributes still honor the requested profile.
+		style.Fg = cell.Style.Fg
+		style.UnderlineColor = cell.Style.UnderlineColor
+	}
+	return style
+}
+
 // updatePen updates the cursor pen styles.
 func (s *TerminalRenderer) updatePen(cell *Cell) {
 	if cell == nil {
@@ -601,9 +620,11 @@ func (s *TerminalRenderer) updatePen(cell *Cell) {
 
 	// Downsample pen when we don't have a [colorprofile.TrueColor],
 	// otherwise, use the original style.
-	newStyle := ConvertStyle(cell.Style, s.profile)
+	newStyle := s.cellStyle(cell)
 	newLink := ConvertLink(cell.Link, s.profile)
-	oldStyle := ConvertStyle(s.cur.Style, s.profile)
+	// The pen records what was actually emitted. Converting it again would
+	// erase protocol colors before we could reset them for ordinary text.
+	oldStyle := s.cur.Style
 	oldLink := ConvertLink(s.cur.Link, s.profile)
 
 	if !newStyle.Equal(&oldStyle) {
@@ -612,7 +633,7 @@ func (s *TerminalRenderer) updatePen(cell *Cell) {
 			seq = ansi.ResetStyle
 		}
 		_, _ = s.buf.WriteString(seq)
-		s.cur.Style = cell.Style // Copy the original style
+		s.cur.Style = newStyle
 	}
 	if !newLink.Equal(&oldLink) {
 		_, _ = s.buf.WriteString(ansi.SetHyperlink(newLink.URL, newLink.Params))
@@ -1713,7 +1734,8 @@ func relativeCursorMove(s *TerminalRenderer, newbuf *RenderBuffer, fx, fy, tx, t
 					cell := newbuf.CellAt(fx+i, ty)
 					if cell != nil && cell.Width > 0 {
 						i += cell.Width - 1
-						if !cell.Style.Equal(&s.cur.Style) || !cell.Link.Equal(&s.cur.Link) {
+						style := s.cellStyle(cell)
+						if !style.Equal(&s.cur.Style) || !cell.Link.Equal(&s.cur.Link) {
 							overwrite = false
 							break
 						}
