@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"hash/maphash"
+	"image/color"
 	"io"
 	"strings"
 	"unicode/utf8"
@@ -155,7 +156,9 @@ type TerminalRenderer struct {
 
 	// profile is the color profile to use when downsampling colors. This is
 	// used to determine the appropriate color the terminal can display.
-	profile colorprofile.Profile
+	profile           colorprofile.Profile
+	colorCacheProfile colorprofile.Profile
+	colorCache        [3]struct{ input, output color.Color }
 }
 
 // NewTerminalRenderer returns a new [TerminalRenderer] that uses the given
@@ -607,7 +610,49 @@ func (s *TerminalRenderer) cellStyle(cell *Cell) Style {
 		style.Fg, style.UnderlineColor = cell.Style.Fg, cell.Style.UnderlineColor
 		return style
 	}
+	if s.profile == colorprofile.ANSI || s.profile == colorprofile.ANSI256 {
+		if s.colorCacheProfile != s.profile {
+			clear(s.colorCache[:])
+			s.colorCacheProfile = s.profile
+		}
+		if style.Fg != nil {
+			style.Fg = s.convertColor(style.Fg, 0)
+		}
+		if style.Bg != nil {
+			style.Bg = s.convertColor(style.Bg, 1)
+		}
+		if style.UnderlineColor != nil {
+			style.UnderlineColor = s.convertColor(style.UnderlineColor, 2)
+		}
+		return style
+	}
 	return ConvertStyle(style, s.profile)
+}
+
+// convertColor reuses the last conversion for each color channel. Keeping the
+// channels separate avoids evicting the foreground when converting a background.
+func (s *TerminalRenderer) convertColor(c color.Color, channel int) color.Color {
+	if !cacheableColor(c) {
+		return s.profile.Convert(c)
+	}
+	cache := &s.colorCache[channel]
+	if cache.input == c {
+		return cache.output
+	}
+	converted := s.profile.Convert(c)
+	cache.input, cache.output = c, converted
+	return converted
+}
+
+// Cache only immutable, comparable values. Custom color implementations can
+// mutate behind a pointer, and equal RGBA values need not have the same indexed
+// color semantics.
+func cacheableColor(c color.Color) bool {
+	switch c.(type) {
+	case nil, color.RGBA, ansi.BasicColor, ansi.IndexedColor, ansi.RGBColor:
+		return true
+	}
+	return false
 }
 
 func isKittyPlaceholder(content string) bool {
@@ -890,11 +935,42 @@ func lineHasDrift(m ansi.Method, line Line) bool {
 		if len(c.Content) == 1 && c.Content[0] >= 0x20 && c.Content[0] < 0x7f {
 			continue
 		}
+		if m == ansi.GraphemeWidth || standardKittyPlaceholder(c.Content) {
+			continue
+		}
 		if m.StringWidth(c.Content) != ansi.StringWidth(c.Content) {
 			return true
 		}
 	}
 	return false
+}
+
+// Kitty's fixed diacritic alphabet is zero-width under both width models.
+// Build membership from the protocol table instead of maintaining a copy.
+var kittyDiacritics = func() map[rune]struct{} {
+	m := map[rune]struct{}{kitty.Diacritic(0): {}}
+	for i := 1; ; i++ {
+		r := kitty.Diacritic(i)
+		if r == kitty.Diacritic(0) {
+			return m
+		}
+		m[r] = struct{}{}
+	}
+}()
+
+func standardKittyPlaceholder(content string) bool {
+	marks, ok := strings.CutPrefix(content, string(kitty.Placeholder))
+	if !ok {
+		return false
+	}
+	count := 0
+	for _, r := range marks {
+		if _, ok := kittyDiacritics[r]; !ok || count == 3 {
+			return false
+		}
+		count++
+	}
+	return true
 }
 
 // paintLine brings row y of the screen in line with newbuf. A drift-prone row,
@@ -1817,6 +1893,8 @@ func relativeCursorMove(s *TerminalRenderer, newbuf *RenderBuffer, fx, fy, tx, t
 // use any optimizations that require the new buffer such as overwrite.
 func moveCursor(s *TerminalRenderer, newbuf *RenderBuffer, x, y int, overwrite bool) (seq string) {
 	fx, fy := s.cur.X, s.cur.Y
+	bestLen := -1
+	absolute := false
 
 	if !s.flags.Contains(tRelativeCursor) {
 		width := -1 // Use -1 to indicate that we don't know the width of the screen.
@@ -1831,10 +1909,11 @@ func moveCursor(s *TerminalRenderer, newbuf *RenderBuffer, x, y int, overwrite b
 			width = newbuf.Width()
 		}
 		// Method #0: Use [ansi.CUP] if the distance is long.
-		seq = ansi.CursorPosition(x+1, y+1)
 		if fx == -1 || fy == -1 || width == -1 || notLocal(width, fx, fy, x, y) {
-			return seq
+			return ansi.CursorPosition(x+1, y+1)
 		}
+		// Keep only the cost until CUP actually wins.
+		bestLen, absolute = cursorPositionLen(x+1, y+1), true
 	}
 
 	// Optimize based on options.
@@ -1858,28 +1937,47 @@ func moveCursor(s *TerminalRenderer, newbuf *RenderBuffer, x, y int, overwrite b
 
 		// Method #1: Use local movement sequences.
 		nseq1 := relativeCursorMove(s, newbuf, fx, fy, x, y, overwrite, useHardTabs, useBackspace)
-		if (i == 0 && len(seq) == 0) || len(nseq1) < len(seq) {
-			seq = nseq1
+		if bestLen < 0 || len(nseq1) < bestLen {
+			seq, bestLen, absolute = nseq1, len(nseq1), false
 		}
 
 		// Method #2: Use [ansi.CR] and local movement sequences.
-		nseq2 := relativeCursorMove(s, newbuf, 0, fy, x, y, overwrite, useHardTabs, useBackspace)
-		nseq2 = "\r" + nseq2
-		if len(nseq2) < len(seq) {
-			seq = nseq2
+		if bestLen > 1 {
+			nseq2 := relativeCursorMove(s, newbuf, 0, fy, x, y, overwrite, useHardTabs, useBackspace)
+			if 1+len(nseq2) < bestLen {
+				seq, bestLen, absolute = "\r"+nseq2, 1+len(nseq2), false
+			}
 		}
 
-		if !s.flags.Contains(tRelativeCursor) {
+		if !s.flags.Contains(tRelativeCursor) && bestLen > len(ansi.CursorHomePosition) {
 			// Method #3: Use [ansi.CursorHomePosition] and local movement sequences.
 			nseq3 := relativeCursorMove(s, newbuf, 0, 0, x, y, overwrite, useHardTabs, useBackspace)
-			nseq3 = ansi.CursorHomePosition + nseq3
-			if len(nseq3) < len(seq) {
-				seq = nseq3
+			if len(ansi.CursorHomePosition)+len(nseq3) < bestLen {
+				seq = ansi.CursorHomePosition + nseq3
+				bestLen, absolute = len(seq), false
 			}
 		}
 	}
 
+	if absolute {
+		return ansi.CursorPosition(x+1, y+1)
+	}
 	return seq
+}
+
+// cursorPositionLen matches ansi.CursorPosition without formatting its arguments.
+func cursorPositionLen(col, row int) int {
+	if row <= 1 && col <= 1 {
+		return len(ansi.CursorHomePosition)
+	}
+	n := 4 // CSI, semicolon, and H
+	for ; col > 0; col /= 10 {
+		n++
+	}
+	for ; row > 0; row /= 10 {
+		n++
+	}
+	return n
 }
 
 // xtermCaps returns whether the terminal is xterm-like. This means that the

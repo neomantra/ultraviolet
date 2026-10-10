@@ -14,7 +14,7 @@ import (
 // Alternate every cell so both frames require real output on every iteration.
 func BenchmarkProtocolColorFrame(b *testing.B) {
 	for _, profile := range []colorprofile.Profile{colorprofile.TrueColor, colorprofile.ANSI256, colorprofile.Ascii} {
-		for _, kind := range []string{"plain", "styled", "kitty"} {
+		for _, kind := range []string{"plain", "styled", "varied", "kitty"} {
 			b.Run(profile.String()+"/"+kind, func(b *testing.B) {
 				frames := [2]*RenderBuffer{NewRenderBuffer(80, 24), NewRenderBuffer(80, 24)}
 				for f, frame := range frames {
@@ -23,6 +23,9 @@ func BenchmarkProtocolColorFrame(b *testing.B) {
 							cell := Cell{Content: string(rune('a' + f)), Width: 1}
 							if kind != "plain" {
 								cell.Style.Fg = color.RGBA{R: 18, G: 52, B: uint8(86 + f), A: 255}
+							}
+							if kind == "varied" {
+								cell.Style.Fg = color.RGBA{R: uint8(x * 3), G: uint8(y * 10), B: uint8(86 + f), A: 255}
 							}
 							if kind == "kitty" {
 								cell.Content = fmt.Sprintf("%c%c%c", kitty.Placeholder, kitty.Diacritic(y), kitty.Diacritic(x))
