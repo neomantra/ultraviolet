@@ -100,9 +100,22 @@ func TestRendererKittyPlaceholderPassThrough(t *testing.T) {
 		{"bare", placeholder, true},
 		{"APC prefix", "\x1b_Ga=q,i=1;\x1b\\" + placeholder, true},
 		{"DCS prefix", "\x1bPdata\x1b\\" + placeholder, true},
+		{"multiple prefixes", "\x1b_Ga=q,i=1;\x1b\\\x1b^data\x1b\\" + placeholder, true},
+		{"C1 APC prefix", "\x9fdata\x1b\\" + placeholder, true},
+		{"SOS prefix", "\x1bXdata\x1b\\" + placeholder, true},
 		{"ordinary text with APC prefix", "\x1b_Ga=q,i=1;\x1b\\X", false},
+		{"placeholder inside APC only", "\x1b_test" + placeholder + "\x1b\\X", false},
+		{"unterminated APC", "\x1b_test" + placeholder, false},
+		{"empty", "", false},
+		{"ordinary text", "X", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if got := isKittyPlaceholder(tc.content); got != tc.wantID {
+				t.Fatalf("isKittyPlaceholder(%q) = %v, want %v", tc.content, got, tc.wantID)
+			}
+			if allocs := testing.AllocsPerRun(100, func() { isKittyPlaceholder(tc.content) }); allocs != 0 {
+				t.Errorf("placeholder detection allocated %g times, want zero", allocs)
+			}
 			var out bytes.Buffer
 			r := NewTerminalRenderer(&out, nil)
 			r.SetColorProfile(colorprofile.Ascii)

@@ -596,20 +596,35 @@ func (s *TerminalRenderer) putCellLR(newbuf *RenderBuffer, cell *Cell) {
 
 // cellStyle converts styling colors while preserving Kitty placeholder IDs.
 func (s *TerminalRenderer) cellStyle(cell *Cell) Style {
-	style := ConvertStyle(cell.Style, s.profile)
-	if s.profile == colorprofile.TrueColor || s.profile == colorprofile.NoTTY {
+	style := cell.Style
+	if s.profile != colorprofile.TrueColor && s.profile != colorprofile.NoTTY &&
+		(style.Fg != nil || style.UnderlineColor != nil) && isKittyPlaceholder(cell.Content) {
+		// These colors encode the image and placement IDs, not presentation.
+		// Keep them out of color conversion altogether. Background and text
+		// attributes still honor the requested profile.
+		style.Fg, style.UnderlineColor = nil, nil
+		style = ConvertStyle(style, s.profile)
+		style.Fg, style.UnderlineColor = cell.Style.Fg, cell.Style.UnderlineColor
 		return style
 	}
-	// A cell may carry a pass-through sequence before its printable glyph.
-	// Only strip escapes on the uncommon path containing a placeholder.
-	if strings.ContainsRune(cell.Content, kitty.Placeholder) &&
-		strings.HasPrefix(ansi.Strip(cell.Content), string(kitty.Placeholder)) {
-		// These colors encode the image and placement IDs, not presentation.
-		// Background and text attributes still honor the requested profile.
-		style.Fg = cell.Style.Fg
-		style.UnderlineColor = cell.Style.UnderlineColor
+	return ConvertStyle(style, s.profile)
+}
+
+func isKittyPlaceholder(content string) bool {
+	// Most cells start with their glyph. Skip only the pass-through sequences
+	// that StyledString can attach before it, without allocating a stripped copy.
+	for !strings.HasPrefix(content, string(kitty.Placeholder)) {
+		if !ansi.HasApcPrefix(content) && !ansi.HasDcsPrefix(content) &&
+			!ansi.HasSosPrefix(content) && !ansi.HasPmPrefix(content) {
+			return false
+		}
+		seq, _, n, _ := ansi.DecodeSequence(content, 0, nil)
+		if n == 0 || !passThrough(seq) {
+			return false
+		}
+		content = content[n:]
 	}
-	return style
+	return true
 }
 
 // updatePen updates the cursor pen styles.
